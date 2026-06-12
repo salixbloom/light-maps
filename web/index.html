@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>light-maps demo</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; }
+    #map { width: 100vw; height: 100vh; }
+
+    #controls {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 10;
+      background: rgba(20,20,20,.88);
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 14px 16px;
+      min-width: 240px;
+      backdrop-filter: blur(6px);
+    }
+    #controls h1 { font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #adf; }
+    #controls label { display: block; font-size: 12px; color: #aaa; margin-bottom: 4px; }
+    #controls input {
+      width: 100%;
+      padding: 6px 8px;
+      background: #222;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #eee;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    #controls button {
+      width: 100%;
+      padding: 7px;
+      background: #1e7ace;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    #controls button:hover { background: #2594f0; }
+    #status { font-size: 11px; color: #777; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <h1>light-maps</h1>
+    <label>Server URL</label>
+    <input id="server" type="text" value="http://localhost:3000" />
+    <label>Tileset (file stem)</label>
+    <input id="tileset" type="text" placeholder="world" />
+    <label>API Key (optional)</label>
+    <input id="apikey" type="password" placeholder="leave blank if none" />
+    <button id="load">Load tileset</button>
+    <div id="status">Enter server details above.</div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+  <script type="module">
+    import { LightMaps } from "./light-maps.js";
+
+    let map = null;
+
+    document.getElementById("load").addEventListener("click", async () => {
+      const server  = document.getElementById("server").value.trim();
+      const tileset = document.getElementById("tileset").value.trim() || null;
+      const apiKey  = document.getElementById("apikey").value.trim() || null;
+      const status  = document.getElementById("status");
+
+      status.textContent = "Loading…";
+      status.style.color = "#aaa";
+
+      try {
+        const lm = new LightMaps({ server, apiKey });
+
+        // Re-use existing map if already initialised.
+        if (map) {
+          map.remove();
+          map = null;
+        }
+
+        map = await lm.createMap("map", {
+          tileset,
+          maplibregl: window.maplibregl,
+        });
+
+        map.addControl(new maplibregl.NavigationControl());
+
+        status.textContent = `Loaded "${tileset ?? "(default)"}" from ${server}`;
+        status.style.color = "#8f8";
+      } catch (err) {
+        status.textContent = `Error: ${err.message}`;
+        status.style.color = "#f88";
+        console.error(err);
+      }
+    });
+
+    // Auto-load if query params provided: ?server=http://...&tileset=world&key=xxx
+    const params = new URLSearchParams(location.search);
+    if (params.has("server")) {
+      document.getElementById("server").value = params.get("server");
+      if (params.has("tileset")) document.getElementById("tileset").value = params.get("tileset");
+      if (params.has("key"))     document.getElementById("apikey").value  = params.get("key");
+      document.getElementById("load").click();
+    }
+  </script>
+</body>
+</html>

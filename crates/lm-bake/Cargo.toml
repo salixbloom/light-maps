@@ -1,0 +1,25 @@
+[package]
+name = "lm-bake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lm-core = { path = "../lm-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+geo = { workspace = true }
+geo-types = { workspace = true }
+geojson = { workspace = true }
+geozero = { version = "0.15", features = ["with-mvt", "with-geojson", "with-geo", "with-shp"] }
+rayon = { workspace = true }
+flate2 = "1"
+brotli = "8"
+csv = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

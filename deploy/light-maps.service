@@ -1,0 +1,47 @@
+[Unit]
+Description=light-maps tile server
+After=network.target
+Documentation=https://github.com/your-org/light-maps
+
+[Service]
+Type=simple
+User=light-maps
+Group=light-maps
+
+# Path to the compiled binary (copy it here after `cargo build --release`)
+ExecStart=/usr/local/bin/lm-serve \
+    /var/lib/light-maps/tiles.pmtiles \
+    --addr 127.0.0.1:3000 \
+    --base-url https://maps.example.com \
+    --cors https://example.com \
+    --timeout 10 \
+    --max-in-flight 512
+
+# Reload on SIGHUP (systemctl reload light-maps) to reopen tile files.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/light-maps
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+# Optional: set API key via environment (avoids it appearing in ps/top)
+# EnvironmentFile=/etc/light-maps/env
+# Environment="LM_API_KEY=your-secret-key"
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=light-maps
+
+[Install]
+WantedBy=multi-user.target
