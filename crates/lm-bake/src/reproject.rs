@@ -28,6 +28,36 @@ pub fn to_mercator(geom: Geometry<f64>) -> Geometry<f64> {
 /// Web Mercator extent: the full sphere maps to ±20037508.3427892 m.
 pub const MERCATOR_EXTENT: f64 = 20_037_508.342_789_2;
 
+/// Map a Web Mercator X coordinate to the tile column index at zoom `z`,
+/// clamped to the valid `0..2^z` range.
+#[inline]
+pub fn merc_x_to_tile(x: f64, z: u8) -> u32 {
+    let tiles = (1u64 << z) as f64;
+    let t = (x + MERCATOR_EXTENT) / (2.0 * MERCATOR_EXTENT) * tiles;
+    clamp_tile(t, z)
+}
+
+/// Map a Web Mercator Y coordinate to the tile row index at zoom `z`.
+/// Tile y=0 is the top (north), so the axis is flipped.
+#[inline]
+pub fn merc_y_to_tile(y: f64, z: u8) -> u32 {
+    let tiles = (1u64 << z) as f64;
+    let t = (MERCATOR_EXTENT - y) / (2.0 * MERCATOR_EXTENT) * tiles;
+    clamp_tile(t, z)
+}
+
+#[inline]
+fn clamp_tile(t: f64, z: u8) -> u32 {
+    let max = (1u32 << z) - 1;
+    if t < 0.0 {
+        0
+    } else if t as u32 > max {
+        max
+    } else {
+        t as u32
+    }
+}
+
 /// Return the Web Mercator bounding box [min_x, min_y, max_x, max_y] for
 /// a tile (z, x, y), with a fractional `buffer` in tile-units added on each side.
 pub fn tile_bbox(z: u8, x: u32, y: u32, buffer: f64) -> (f64, f64, f64, f64) {

@@ -2,8 +2,18 @@
 ///
 /// Supports multiple input layers, gzip and/or brotli tile compression,
 /// per-zoom simplification tolerance overrides, and parallel tile generation.
-use std::io::Write;
+use std::{
+    io::Write,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
+use std::collections::HashMap;
+
+use geo::BoundingRect;
 use rayon::prelude::*;
 
 use lm_core::{
@@ -16,8 +26,8 @@ use crate::{
     error::BakeError,
     ingest::ingest_geojson,
     manifest::{LayerInfo, Manifest},
-    reproject::{tile_bbox, to_mercator},
-    simplify::simplify_for_zoom,
+    reproject::{merc_x_to_tile, merc_y_to_tile, tile_bbox, to_mercator},
+    simplify::{simplify_for_zoom, simplify_tolerance},
     tile_clip::clip_to_tile,
     tile_encode::{encode_tile, EncodableFeature},
 };
@@ -71,12 +81,35 @@ pub struct BakeOutput {
 /// Bake a single GeoJSON string into a PMTiles archive.
 pub fn bake(geojson_src: &str, config: BakeConfig) -> Result<BakeOutput, BakeError> {
     let layer = ingest_geojson(&config.layer_name, geojson_src)?;
+    bake_layer(layer, config)
+}
+
+/// Bake an already-ingested layer into a PMTiles archive.
+///
+/// This is the allocation-light entry point: callers that stream a large input
+/// (e.g. line-delimited GeoJSON) build the `IngestedLayer` directly and hand it
+/// here, avoiding a re-serialize-then-reparse round-trip through a GeoJSON
+/// string.
+pub fn bake_layer(
+    layer: crate::ingest::IngestedLayer,
+    config: BakeConfig,
+) -> Result<BakeOutput, BakeError> {
     let bounds = layer.bounds;
     let layer_info = layer.layer_info.clone();
 
     let entries = bake_layer_to_entries(&layer.features, &config)?;
-    let tile_count = entries.len();
+    write_archive(entries, layer_info, bounds, &config)
+}
 
+/// Assemble baked tile entries into a finished PMTiles archive (single-layer).
+/// Shared by the in-memory and streaming bake paths.
+pub fn write_archive(
+    entries: Vec<TileEntry>,
+    layer_info: LayerInfo,
+    bounds: [f64; 4],
+    config: &BakeConfig,
+) -> Result<BakeOutput, BakeError> {
+    let tile_count = entries.len();
     let center = [
         (bounds[0] + bounds[2]) / 2.0,
         (bounds[1] + bounds[3]) / 2.0,
@@ -193,55 +226,239 @@ pub fn bake_multi(
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-type FeatureVec = Vec<(geo_types::Geometry<f64>, serde_json::Map<String, geojson::JsonValue>)>;
+/// A feature is dropped at a given zoom when its mercator bounding box is below
+/// this many MVT grid-units on *both* axes — it would render as sub-pixel noise.
+/// Shared by the in-memory and streaming bake paths so they agree on output.
+pub(crate) const MIN_FEATURE_PIXELS: f64 = 1.0;
+
+type PropMap = serde_json::Map<String, geojson::JsonValue>;
+type FeatureVec = Vec<(geo_types::Geometry<f64>, PropMap)>;
 
 fn bake_layer_to_entries(
     features: &FeatureVec,
     config: &BakeConfig,
 ) -> Result<Vec<TileEntry>, BakeError> {
-    // Reproject once upfront.
-    let mercator: Vec<_> = features
+    // Reproject once upfront. We keep a borrowed reference to each feature's
+    // properties (`&Map`) rather than cloning — a tile only clones the props of
+    // the (few) features that land in it.
+    let mercator: Vec<(geo_types::Geometry<f64>, &PropMap)> = features
         .iter()
         .map(|(g, p)| (to_mercator(g.clone()), p))
         .collect();
 
-    let tile_jobs: Vec<(u8, u32, u32)> = (config.min_zoom..=config.max_zoom)
-        .flat_map(|z| {
-            let n = 1u32 << z;
-            (0..n).flat_map(move |x| (0..n).map(move |y| (z, x, y)))
-        })
-        .collect();
+    // Progress is measured as (zoom levels × features) work units — a real,
+    // bounded quantity, unlike the 2^z × 2^z phantom-tile grid the old code
+    // tried to iterate (357M at z14, which is what caused the memory blow-up).
+    let n_features = mercator.len();
+    let n_zooms = (config.max_zoom - config.min_zoom + 1) as usize;
+    let total: usize = n_features * n_zooms;
 
-    let entries: Vec<TileEntry> = tile_jobs
+    let processed = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
+    // Opening line — printed before any work so there's always immediate output.
+    print_open_line(&config.layer_name, n_features, n_zooms, config, is_tty);
+
+    let progress_thread = spawn_progress_thread(
+        Arc::clone(&processed),
+        Arc::clone(&done),
+        config.layer_name.clone(),
+        total,
+        is_tty,
+    );
+
+    // Process one zoom level at a time. For each zoom we bin features into the
+    // tiles they actually touch (driven by each feature's bounding box), so the
+    // working set is bounded by the data — not by 2^z × 2^z.
+    let mut entries: Vec<TileEntry> = Vec::new();
+
+    for z in config.min_zoom..=config.max_zoom {
+        let zoom_entries = bake_zoom(&mercator, z, config, &processed)?;
+        entries.extend(zoom_entries);
+    }
+
+    done.store(true, Ordering::Relaxed);
+    let _ = progress_thread.join();
+
+    Ok(entries)
+}
+
+/// Bake every populated tile at a single zoom level.
+///
+/// Rather than visiting all 2^z × 2^z tile slots, we simplify each feature once,
+/// compute the tile range its bounding box covers, and clip it into only those
+/// tiles. The result is a sparse `(x,y) → features` map whose size is bounded by
+/// the dataset, not the zoom grid.
+fn bake_zoom(
+    mercator: &[(geo_types::Geometry<f64>, &PropMap)],
+    z: u8,
+    config: &BakeConfig,
+    processed: &Arc<AtomicUsize>,
+) -> Result<Vec<TileEntry>, BakeError> {
+    // 1-tile buffer matches the clip buffer so features straddling a tile edge
+    // are captured by both neighbours.
+    type TileKey = (u32, u32);
+    let mut buckets: HashMap<TileKey, Vec<EncodableFeature>> = HashMap::new();
+
+    let max_tile = (1u32 << z) - 1;
+    // Features smaller than ~1 pixel at this zoom are dropped (sub-pixel noise).
+    // Keeps the in-memory path consistent with the streaming path.
+    let drop_size = simplify_tolerance(z) * MIN_FEATURE_PIXELS;
+
+    for (geom, props) in mercator {
+        // Tile range is derived from the *original* (unsimplified) bbox, which is
+        // the conservative, larger extent — simplification only shrinks geometry,
+        // so this never misses a tile the feature touches.
+        let bbox = match geom.bounding_rect() {
+            Some(b) => b,
+            None => {
+                processed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+
+        // Drop *extended* features (lines/polygons) whose bbox is sub-pixel at
+        // this zoom. Points have a zero-size bbox and are always kept.
+        let w = bbox.max().x - bbox.min().x;
+        let h = bbox.max().y - bbox.min().y;
+        if (w > 0.0 || h > 0.0) && w < drop_size && h < drop_size {
+            processed.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        // One-tile pad on each side so edge-straddling geometry reaches the
+        // neighbouring tile (matches clip_to_tile's buffer).
+        let x_min = merc_x_to_tile(bbox.min().x, z).saturating_sub(1);
+        let x_max = (merc_x_to_tile(bbox.max().x, z) + 1).min(max_tile);
+        // Y axis is flipped: max mercator-y → min tile-y.
+        let y_min = merc_y_to_tile(bbox.max().y, z).saturating_sub(1);
+        let y_max = (merc_y_to_tile(bbox.min().y, z) + 1).min(max_tile);
+
+        for x in x_min..=x_max {
+            for y in y_min..=y_max {
+                let (tmin_x, tmin_y, tmax_x, tmax_y) = tile_bbox(z, x, y, 0.0);
+                // Clip → simplify → clip again (the second clip trims any geometry
+                // the simplifier nudged back outside the tile).
+                let clipped = match clip_to_tile(geom.clone(), tmin_x, tmin_y, tmax_x, tmax_y) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                let s = match simplify_for_zoom(clipped, z) {
+                    Some(g) => g,
+                    None => continue,
+                };
+                if let Some(g) = clip_to_tile(s, tmin_x, tmin_y, tmax_x, tmax_y) {
+                    buckets
+                        .entry((x, y))
+                        .or_default()
+                        .push(EncodableFeature { geom: g, props: (*props).clone() });
+                }
+            }
+        }
+
+        processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Encode + compress populated tiles in parallel. The number of populated
+    // tiles is bounded by the data footprint, so this Vec stays small.
+    let layer_name = &config.layer_name;
+    let compression = config.compression;
+
+    let entries: Vec<TileEntry> = buckets
         .into_par_iter()
-        .filter_map(|(z, x, y)| {
-            let (min_x, min_y, max_x, max_y) = tile_bbox(z, x, y, 0.0);
-
-            let tile_feats: Vec<EncodableFeature> = mercator
-                .iter()
-                .filter_map(|(geom, props)| {
-                    // Clip first (fast bbox guard), then simplify, then re-clip.
-                    let clipped = clip_to_tile(geom.clone(), min_x, min_y, max_x, max_y)?;
-                    let simplified = simplify_for_zoom(clipped, z)?;
-                    clip_to_tile(simplified, min_x, min_y, max_x, max_y).map(|g| {
-                        EncodableFeature { geom: g, props: (*props).clone() }
-                    })
-                })
-                .collect();
-
-            if tile_feats.is_empty() {
+        .filter_map(|((x, y), feats)| {
+            if feats.is_empty() {
                 return None;
             }
-
-            let raw = encode_tile(&config.layer_name, &tile_feats, min_x, min_y, max_x, max_y)
-                .ok()?;
-            let compressed = compress(&raw, config.compression).ok()?;
-
+            let (tmin_x, tmin_y, tmax_x, tmax_y) = tile_bbox(z, x, y, 0.0);
+            let raw = encode_tile(layer_name, &feats, tmin_x, tmin_y, tmax_x, tmax_y).ok()?;
+            let compressed = compress(&raw, compression).ok()?;
             Some(TileEntry { tile_id: tile_to_id(z, x, y), data: compressed })
         })
         .collect();
 
     Ok(entries)
+}
+
+/// Print the opening progress line before any work starts. Shared with the
+/// streaming bake path.
+pub fn print_open_line(
+    layer: &str,
+    n_features: usize,
+    n_zooms: usize,
+    config: &BakeConfig,
+    is_tty: bool,
+) {
+    let total = n_features * n_zooms;
+    let mut stderr = std::io::stderr();
+    if is_tty {
+        let _ = write!(
+            stderr,
+            "  [{}] {:>7} / {} feature-zooms (  0%)  00:00 elapsed  ",
+            layer, 0, total
+        );
+        let _ = stderr.flush();
+    } else {
+        eprintln!(
+            "  [{}] starting — {} features × {} zoom levels (z{}-z{})",
+            layer, n_features, n_zooms, config.min_zoom, config.max_zoom
+        );
+    }
+}
+
+/// Spawn the background progress reporter. Returns the join handle. Shared with
+/// the streaming bake path.
+pub fn spawn_progress_thread(
+    processed: Arc<AtomicUsize>,
+    done: Arc<AtomicBool>,
+    layer: String,
+    total: usize,
+    is_tty: bool,
+) -> std::thread::JoinHandle<()> {
+    let start = Instant::now();
+    std::thread::spawn(move || {
+        let mut stderr = std::io::stderr();
+        let mut last_log_secs = 0u64;
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+
+            let is_done = done.load(Ordering::Relaxed);
+            let n = processed.load(Ordering::Relaxed);
+            let secs = start.elapsed().as_secs();
+            let pct = if total > 0 { n * 100 / total } else { 100 };
+            let elapsed_str = format!("{:02}:{:02}", secs / 60, secs % 60);
+
+            if is_tty {
+                let _ = write!(
+                    stderr,
+                    "\r  [{layer}] {n:>7} / {total} feature-zooms ({pct:>3}%)  {elapsed_str} elapsed  "
+                );
+                let _ = stderr.flush();
+            } else if secs > last_log_secs {
+                last_log_secs = secs;
+                eprintln!("  [{layer}] {n} / {total} feature-zooms ({pct}%)  {elapsed_str} elapsed");
+            }
+
+            if is_done {
+                break;
+            }
+        }
+
+        let n = processed.load(Ordering::Relaxed);
+        let secs = start.elapsed().as_secs();
+        let pct = if total > 0 { n * 100 / total } else { 100 };
+        let elapsed_str = format!("{:02}:{:02}", secs / 60, secs % 60);
+        if is_tty {
+            let _ = writeln!(
+                stderr,
+                "\r  [{layer}] {n:>7} / {total} feature-zooms ({pct:>3}%)  {elapsed_str} elapsed  "
+            );
+        } else {
+            eprintln!("  [{layer}] {n} / {total} feature-zooms ({pct}%)  {elapsed_str} elapsed");
+        }
+    })
 }
 
 /// Re-encode tiles that share the same tile_id across layers into a single
@@ -295,6 +512,12 @@ fn combine_mvt_layers(layers: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, BakeError> 
         combined.extend_from_slice(data);
     }
     Ok(combined)
+}
+
+/// Compress one tile blob with the configured codec. Public so the streaming
+/// bake path can share it.
+pub fn compress_tile(data: &[u8], comp: TileCompression) -> Result<Vec<u8>, BakeError> {
+    compress(data, comp)
 }
 
 fn compress(data: &[u8], comp: TileCompression) -> Result<Vec<u8>, BakeError> {
