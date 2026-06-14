@@ -1,12 +1,16 @@
 use std::{path::PathBuf, process};
 
+use std::collections::HashSet;
+
 use lm_bake::{
+    estimate::estimate_input,
     formats::{
         csv::ingest_csv,
         geojsonseq::{ingest_geojsonseq, ingest_geojsonseq_reader},
         shapefile::ingest_shapefile,
     },
     ingest::{ingest_geojson, IngestedLayer},
+    interactive::{pick_fields, Choice},
     pipeline::{bake_layer, bake_multi, BakeConfig, LayerInput, TileCompression},
     prepare::{prepare_input, Prepared},
     streaming::bake_layer_streaming,
@@ -52,6 +56,9 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
     let mut attribution: Option<String> = None;
     let mut output: PathBuf = PathBuf::from("out.pmtiles");
     let mut tolerance_factor: f64 = 1.0;
+    let mut interactive = false;
+    let mut include_fields: Option<Vec<String>> = None;
+    let mut exclude_fields: Vec<String> = Vec::new();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -95,6 +102,23 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
                 i += 1;
                 output = PathBuf::from(next_arg(&args, i, "-o")?);
             }
+            "--interactive" => {
+                interactive = true;
+            }
+            "--include-fields" => {
+                i += 1;
+                let val = next_arg(&args, i, "--include-fields")?;
+                include_fields = Some(
+                    val.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect(),
+                );
+            }
+            "--exclude-fields" => {
+                i += 1;
+                let val = next_arg(&args, i, "--exclude-fields")?;
+                exclude_fields.extend(
+                    val.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
+                );
+            }
             flag if flag.starts_with('-') => {
                 anyhow::bail!("unknown flag: {flag}");
             }
@@ -131,6 +155,20 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         .map(|(path, name)| prepare_input(path, name))
         .collect::<anyhow::Result<_>>()?;
 
+    // ── field selection ─────────────────────────────────────────────────────────
+    // Resolve which property fields to keep. Precedence:
+    //   1. --interactive  → sample the input, show the picker, use its result
+    //   2. --include-fields → keep exactly that set
+    //   3. --exclude-fields → keep everything except that set (needs the field
+    //      list, so we sample the input to discover field names)
+    //   4. neither          → keep all (keep_fields = None)
+    let keep_fields = resolve_keep_fields(
+        &prepared[0].path,
+        interactive,
+        include_fields,
+        &exclude_fields,
+    )?;
+
     let cfg = BakeConfig {
         layer_name: layer_names[0].clone(),
         min_zoom,
@@ -138,6 +176,7 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         attribution,
         compression,
         tolerance_factor,
+        keep_fields,
     };
 
     // ── bake ──────────────────────────────────────────────────────────────────
@@ -152,13 +191,25 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
             .to_lowercase();
 
         if matches!(ext.as_str(), "geojsonl" | "geojsons" | "ndjson") {
-            // Line-delimited input → memory-bounded streaming bake. Features are
-            // spilled to a temp store; only a small index stays in RAM. This is
-            // what makes multi-million-feature files bakeable.
-            let file = std::fs::File::open(path)?;
-            let store = streaming_store_path(&layer_names[0]);
-            bake_layer_streaming(file, &cfg, store)
-                .map_err(|e| anyhow::anyhow!("bake failed: {e}"))?
+            // Line-delimited input → memory-bounded streaming bake. Tiles are
+            // written directly to the output file as produced; no Vec<TileEntry>
+            // buffer grows in RAM.
+            let input_file = std::fs::File::open(path)?;
+            let store_path = streaming_store_path(&layer_names[0], "store");
+            let tile_tmp   = streaming_store_path(&layer_names[0], "tiles");
+            let mut out_file = std::fs::File::create(&output)?;
+            let result = bake_layer_streaming(input_file, &cfg, store_path, tile_tmp, &mut out_file)
+                .map_err(|e| anyhow::anyhow!("bake failed: {e}"))?;
+            info!(
+                tiles  = result.tile_count,
+                bytes  = result.archive_bytes,
+                output = %output.display(),
+                "done"
+            );
+            // prepared (temp files) dropped here.
+            return Ok(());
+            #[allow(unreachable_code)]
+            result
         } else {
             // Single small layer: ingest to an IngestedLayer and bake in memory —
             // no GeoJSON-string round-trip.
@@ -237,9 +288,8 @@ fn ingest_to_layer(path: &PathBuf, layer_name: &str) -> anyhow::Result<IngestedL
     Ok(layer)
 }
 
-/// Temp path for the streaming bake's on-disk feature store. Lives in the temp
-/// dir; the streaming reader deletes it on completion.
-fn streaming_store_path(layer_name: &str) -> PathBuf {
+/// Temp path for streaming bake scratch files (feature store or tile buffer).
+fn streaming_store_path(layer_name: &str, kind: &str) -> PathBuf {
     let safe: String = layer_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -249,7 +299,7 @@ fn streaming_store_path(layer_name: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("lm-bake-store-{safe}-{pid}-{nanos}.bin"))
+    std::env::temp_dir().join(format!("lm-bake-{kind}-{safe}-{pid}-{nanos}.bin"))
 }
 
 // ── format dispatch ───────────────────────────────────────────────────────────
@@ -325,6 +375,51 @@ fn next_arg(args: &[String], i: usize, flag: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
 }
 
+/// Resolve the property-field keep-set from the CLI flags, sampling the input as
+/// needed. Returns `None` to mean "keep all fields".
+fn resolve_keep_fields(
+    input: &PathBuf,
+    interactive: bool,
+    include_fields: Option<Vec<String>>,
+    exclude_fields: &[String],
+) -> anyhow::Result<Option<HashSet<String>>> {
+    // Explicit include list wins and needs no sampling.
+    if let Some(list) = include_fields {
+        return Ok(Some(list.into_iter().collect()));
+    }
+
+    if interactive {
+        if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            anyhow::bail!("--interactive requires a terminal (stderr is not a TTY)");
+        }
+        let est = estimate_input(input)
+            .ok_or_else(|| anyhow::anyhow!("could not sample input for estimate"))?;
+        match pick_fields(&est) {
+            Choice::Proceed(keep) => return Ok(Some(keep)),
+            Choice::Abort => {
+                info!("bake cancelled");
+                std::process::exit(0);
+            }
+        }
+    }
+
+    // Exclude list: sample to learn the full field set, then subtract.
+    if !exclude_fields.is_empty() {
+        let est = estimate_input(input)
+            .ok_or_else(|| anyhow::anyhow!("could not sample input to apply --exclude-fields"))?;
+        let drop: HashSet<&str> = exclude_fields.iter().map(String::as_str).collect();
+        let keep: HashSet<String> = est
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .filter(|name| !drop.contains(name.as_str()))
+            .collect();
+        return Ok(Some(keep));
+    }
+
+    Ok(None)
+}
+
 fn print_usage() {
     eprintln!(
         r#"lm-bake — convert geodata to a PMTiles vector tile archive
@@ -347,11 +442,17 @@ OPTIONS
   --attribution <text>     Attribution string stored in metadata
   --tolerance <factor>     Simplification multiplier (default: 1.0)
   -o / --output <path>     Output path (default: out.pmtiles)
+  --interactive            Sample the input, show an estimate, and pick which
+                           property fields to keep before baking (TTY only)
+  --include-fields <list>  Keep only these comma-separated property fields
+  --exclude-fields <list>  Keep all fields except these comma-separated ones
 
 EXAMPLES
   lm-bake roads.geojson --layer roads --max-zoom 14 -o roads.pmtiles
   lm-bake points.csv --layer stops --max-zoom 12 -o stops.pmtiles
   lm-bake roads.geojson buildings.geojson --layers roads,buildings -o city.pmtiles
+  lm-bake parcels.geojsonl --interactive -o parcels.pmtiles
+  lm-bake parcels.geojsonl --exclude-fields DATA_LINK,SUB_ADDRESS -o parcels.pmtiles
   lm-bake inspect roads.pmtiles
 "#
     );

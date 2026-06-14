@@ -1,7 +1,9 @@
 pub mod error;
+pub mod estimate;
 pub mod feature_store;
 pub mod formats;
 pub mod ingest;
+pub mod interactive;
 pub mod manifest;
 pub mod pipeline;
 pub mod prepare;
@@ -14,3 +16,4 @@ pub mod tile_encode;
 pub use error::BakeError;
 pub use pipeline::{bake, bake_layer, BakeConfig, BakeOutput};
 pub use streaming::bake_layer_streaming;
+pub use pipeline::TileCompression;

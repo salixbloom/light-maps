@@ -27,6 +27,7 @@ rayon = { workspace = true }
 flate2 = "1"
 brotli = "8"
 csv = "1"
+inquire = "0.7"
 memmap2 = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 tracing = { workspace = true }

@@ -74,6 +74,20 @@ impl StoreWriter {
         Ok(FeatureMeta { bbox, offset, len })
     }
 
+    /// Append an already-encoded record verbatim, returning its new index entry.
+    ///
+    /// Used by the spatial-sort rewrite pass to relocate records without paying
+    /// to decode + re-encode geometry and re-serialize properties. The caller
+    /// supplies the record's existing `bbox` (carried over unchanged) and the raw
+    /// bytes copied straight from the source store.
+    pub fn append_raw(&mut self, bbox: [f64; 4], raw: &[u8]) -> Result<FeatureMeta, BakeError> {
+        let offset = self.pos;
+        let len = raw.len() as u32;
+        self.out.write_all(raw)?;
+        self.pos += len as u64;
+        Ok(FeatureMeta { bbox, offset, len })
+    }
+
     /// Flush and finalize, returning a reader over the written data.
     pub fn finish(mut self) -> Result<StoreReader, BakeError> {
         self.out.flush()?;
@@ -91,7 +105,7 @@ pub struct StoreReader {
 }
 
 impl StoreReader {
-    fn open(path: PathBuf) -> Result<Self, BakeError> {
+    pub fn open(path: PathBuf) -> Result<Self, BakeError> {
         let file = File::open(&path)?;
         // SAFETY: the store file is written once and not mutated while mapped.
         let mmap = unsafe { Mmap::map(&file)? };
@@ -110,6 +124,15 @@ impl StoreReader {
         let props: PropMap =
             serde_json::from_slice(props_bytes).map_err(|e| BakeError::Encode(e.to_string()))?;
         Ok((geom, props))
+    }
+
+    /// Return the raw encoded record bytes for `meta` (geometry + length-prefixed
+    /// property blob), without decoding. Used by the spatial-sort rewrite to
+    /// relocate a record by a plain byte copy.
+    pub fn read_raw(&self, meta: &FeatureMeta) -> &[u8] {
+        let start = meta.offset as usize;
+        let end = start + meta.len as usize;
+        &self.mmap[start..end]
     }
 
     pub fn path(&self) -> &Path {

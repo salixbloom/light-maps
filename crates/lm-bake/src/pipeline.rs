@@ -46,6 +46,11 @@ pub struct BakeConfig {
     /// Per-zoom tolerance multiplier (1.0 = default pixel resolution).
     /// Higher = more aggressive simplification at that zoom.
     pub tolerance_factor: f64,
+    /// Property-field filter. `None` keeps every field; `Some(set)` keeps only
+    /// the named fields and drops the rest before storing — trimming both the
+    /// feature store and the per-feature RAM held during tiling. Used by the
+    /// `--include-fields` / `--exclude-fields` flags and the interactive picker.
+    pub keep_fields: Option<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,6 +68,7 @@ impl Default for BakeConfig {
             attribution: None,
             compression: TileCompression::Gzip,
             tolerance_factor: 1.0,
+            keep_fields: None,
         }
     }
 }
@@ -231,6 +237,24 @@ pub fn bake_multi(
 /// Shared by the in-memory and streaming bake paths so they agree on output.
 pub(crate) const MIN_FEATURE_PIXELS: f64 = 1.0;
 
+/// Clip a mercator geometry into one tile, simplify, then clip again.
+///
+/// Returns `None` if the geometry does not intersect the tile after clipping and
+/// simplification. Both the in-memory and streaming bake paths use this function
+/// so their tile-inclusion decisions are provably identical.
+pub fn clip_and_simplify_for_tile(
+    geom: geo_types::Geometry<f64>,
+    z: u8,
+    tmin_x: f64,
+    tmin_y: f64,
+    tmax_x: f64,
+    tmax_y: f64,
+) -> Option<geo_types::Geometry<f64>> {
+    let clipped = clip_to_tile(geom, tmin_x, tmin_y, tmax_x, tmax_y)?;
+    let simplified = simplify_for_zoom(clipped, z)?;
+    clip_to_tile(simplified, tmin_x, tmin_y, tmax_x, tmax_y)
+}
+
 type PropMap = serde_json::Map<String, geojson::JsonValue>;
 type FeatureVec = Vec<(geo_types::Geometry<f64>, PropMap)>;
 
@@ -338,17 +362,9 @@ fn bake_zoom(
         for x in x_min..=x_max {
             for y in y_min..=y_max {
                 let (tmin_x, tmin_y, tmax_x, tmax_y) = tile_bbox(z, x, y, 0.0);
-                // Clip → simplify → clip again (the second clip trims any geometry
-                // the simplifier nudged back outside the tile).
-                let clipped = match clip_to_tile(geom.clone(), tmin_x, tmin_y, tmax_x, tmax_y) {
-                    Some(g) => g,
-                    None => continue,
-                };
-                let s = match simplify_for_zoom(clipped, z) {
-                    Some(g) => g,
-                    None => continue,
-                };
-                if let Some(g) = clip_to_tile(s, tmin_x, tmin_y, tmax_x, tmax_y) {
+                if let Some(g) = clip_and_simplify_for_tile(
+                    geom.clone(), z, tmin_x, tmin_y, tmax_x, tmax_y,
+                ) {
                     buckets
                         .entry((x, y))
                         .or_default()

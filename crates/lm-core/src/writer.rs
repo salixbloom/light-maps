@@ -110,13 +110,13 @@ pub fn write_pmtiles<W: Write>(
     header[99] = 1; // tile_type = MVT
     header[100] = min_zoom;
     header[101] = max_zoom;
-    wru32(&mut header, 102, (bounds[0] * 1e7) as u32);
-    wru32(&mut header, 106, (bounds[1] * 1e7) as u32);
-    wru32(&mut header, 110, (bounds[2] * 1e7) as u32);
-    wru32(&mut header, 114, (bounds[3] * 1e7) as u32);
+    wri32(&mut header, 102, (bounds[0] * 1e7) as i32);
+    wri32(&mut header, 106, (bounds[1] * 1e7) as i32);
+    wri32(&mut header, 110, (bounds[2] * 1e7) as i32);
+    wri32(&mut header, 114, (bounds[3] * 1e7) as i32);
     header[118] = center[2] as u8;
-    wru32(&mut header, 119, (center[0] * 1e7) as u32);
-    wru32(&mut header, 123, (center[1] * 1e7) as u32);
+    wri32(&mut header, 119, (center[0] * 1e7) as i32);
+    wri32(&mut header, 123, (center[1] * 1e7) as i32);
 
     let mut written = 0u64;
     out.write_all(&header)?; written += 127;
@@ -178,7 +178,7 @@ fn wru64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-fn wru32(buf: &mut [u8], off: usize, v: u32) {
+fn wri32(buf: &mut [u8], off: usize, v: i32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 

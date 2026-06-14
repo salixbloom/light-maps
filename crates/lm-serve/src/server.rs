@@ -226,7 +226,20 @@ fn tilejson_for(state: &AppState, set: &str) -> Response {
         "center": meta.get("center").cloned().unwrap_or(serde_json::json!([0,0,2])),
         "tiles": [tiles_url],
         "attribution": meta.get("attribution").cloned(),
-        "vector_layers": meta.get("layers").cloned().unwrap_or(serde_json::json!([])),
+        "vector_layers": meta.get("layers")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(|l| serde_json::json!({
+                "id": l.get("name").cloned().unwrap_or(serde_json::json!(set)),
+                "minzoom": meta.get("min_zoom").and_then(|v| v.as_u64()).unwrap_or(0),
+                "maxzoom": meta.get("max_zoom").and_then(|v| v.as_u64()).unwrap_or(14),
+                "fields": l.get("fields")
+                    .and_then(|f| f.as_array())
+                    .map(|fields| fields.iter()
+                        .filter_map(|f| Some((f.get("name")?.as_str()?, f.get("type")?.as_str()?)))
+                        .collect::<std::collections::HashMap<_,_>>())
+                    .unwrap_or_default(),
+            })).collect::<Vec<_>>())
+            .unwrap_or_default(),
     }))
     .into_response()
 }
